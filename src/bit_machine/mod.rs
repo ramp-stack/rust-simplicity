@@ -6,23 +6,25 @@
 //! frame management optimizations which can be used to great benefit.
 //!
 
-mod frame;
-mod limits;
-mod tracker;
+use simplicity_sys::c_jets::frame_ffi::{c_readBit, c_writeBit, CFrameItem};
+use simplicity_sys::c_jets::uword_width;
+use simplicity_sys::ffi::UWORD;
 
 use std::error;
 use std::fmt;
 use std::sync::Arc;
 
 use crate::analysis;
-use crate::jet::JetEnvironment;
-use crate::jet::{Jet, JetFailed};
+use crate::jet::{Jet, JetEnvironment, JetFailed};
 use crate::node::{self, RedeemNode};
 use crate::types::Final;
 use crate::{Cmr, FailEntropy, Value};
-use frame::Frame;
 
+mod frame;
+use frame::Frame;
+mod limits;
 pub use self::limits::LimitError;
+mod tracker;
 pub use self::tracker::{
     ExecTracker, NoTracker, NodeOutput, PruneTracker, SetTracker, StderrTracker,
 };
@@ -166,14 +168,6 @@ impl BitMachine {
             .write_u8(value, &mut self.data);
     }
 
-    /// Read a bit from the active read frame
-    fn read_bit(&mut self) -> bool {
-        self.read
-            .last_mut()
-            .expect("Empty read frame stack")
-            .read_bit(&self.data)
-    }
-
     /// Write a bit string to the active write frame
     fn write_bytes(&mut self, bytes: &[u8]) {
         for bit in bytes {
@@ -186,19 +180,6 @@ impl BitMachine {
         for bit in val.iter_padded() {
             self.write_bit(bit);
         }
-    }
-
-    /// Return the bit width of the active read frame.
-    fn active_read_bit_width(&self) -> usize {
-        self.read.last().map(|frame| frame.bit_width()).unwrap_or(0)
-    }
-
-    /// Return the bit width of the active write frame.
-    fn active_write_bit_width(&self) -> usize {
-        self.write
-            .last()
-            .map(|frame| frame.bit_width())
-            .unwrap_or(0)
     }
 
     /// Add a read frame with some given value in it, as input to the
@@ -238,10 +219,25 @@ impl BitMachine {
     ///
     /// The Bit Machine is constructed via [`Self::for_program()`] to ensure enough space.
     pub fn exec_with_tracker<JE: JetEnvironment, T: ExecTracker>(
-        &mut self,
-        program: &RedeemNode,
-        env: &JE,
-        tracker: &mut T,
+        &mut self, program: &RedeemNode, env: &JE, tracker: &mut T,
+    ) -> Result<Value, ExecutionError> {
+        self.exec_with_jets(program, env, tracker, |_, _| None)
+    }
+
+    /// Execute a program with custom Rust jets and the given environment and tracker.
+    ///
+    /// The callback receives each jet and an iterator starting at its input. It must consume
+    /// only the jet's declared source type. Returning `None` delegates to the environment;
+    /// returning `Some(Err(_))` aborts execution. Successful output must have the declared
+    /// target type, otherwise this method panics.
+    ///
+    /// The callback may borrow mutable state. Its effects are not rolled back on failure;
+    /// callers requiring atomic changes must keep them private until execution succeeds.
+    ///
+    /// The Bit Machine must be constructed via [`Self::for_program()`] to ensure enough space.
+    pub fn exec_with_jets<JE: JetEnvironment, T: ExecTracker>(
+        &mut self, program: &RedeemNode, env: &JE, tracker: &mut T,
+        mut execute: impl FnMut(&dyn Jet, FrameIter<'_>) -> Option<Result<Value, JetFailed>>,
     ) -> Result<Value, ExecutionError> {
         enum CallStack<'a> {
             Goto(&'a RedeemNode),
@@ -373,12 +369,20 @@ impl BitMachine {
                 }
                 node::Inner::Witness(value) => self.write_value(value),
                 node::Inner::Jet(jet) => {
-                    let typed_jet = jet
-                        .as_ref()
-                        .as_any()
-                        .downcast_ref::<JE::Jet>()
-                        .ok_or(ExecutionError::JetTypeMismatch)?;
-                    jet_result = self.exec_jet(typed_jet, env);
+                    let input = input_frame.as_ref()
+                        .map(|frame| frame.as_bit_iter_from_cursor(&self.data))
+                        .unwrap_or(crate::BitIter::from([].iter().copied()));
+                    jet_result = match execute(jet.as_ref(), input) {
+                        Some(result) => result.map(|output| {
+                            assert!(output.is_of_type(&ip.arrow().target), "Invalid jet output");
+                            self.write_value(&output);
+                        }),
+                        None => {
+                            let typed_jet = jet.as_ref().as_any().downcast_ref::<JE::Jet>()
+                                .ok_or(ExecutionError::JetTypeMismatch)?;
+                            self.exec_jet_into_frame(typed_jet, env)
+                        }
+                    };
                 }
                 node::Inner::Word(value) => self.write_value(value.as_value()),
                 node::Inner::Fail(entropy) => {
@@ -443,105 +447,55 @@ impl BitMachine {
         }
     }
 
-    fn exec_jet<JE: JetEnvironment>(&mut self, jet: &JE::Jet, env: &JE) -> Result<(), JetFailed> {
-        use crate::ffi::c_jets::frame_ffi::{c_readBit, c_writeBit, CFrameItem};
-        use crate::ffi::c_jets::uword_width;
-        use crate::ffi::ffi::UWORD;
-
-        /// Create new C read frame that contains `bit_width` many bits from active read frame.
-        ///
-        /// Return C read frame together with underlying buffer.
-        ///
-        /// ## Safety
-        ///
-        /// The returned frame must outlive its buffer or there is a dangling pointer.
-        ///
-        /// ## Panics
-        ///
-        /// Active read frame has fewer bits than `bit_width`.
-        unsafe fn get_input_frame(
-            mac: &mut BitMachine,
-            bit_width: usize,
-        ) -> (CFrameItem, Vec<UWORD>) {
-            assert!(bit_width <= mac.active_read_bit_width());
-            let uword_width = uword_width(bit_width);
-            let mut buffer = vec![0; uword_width];
-
-            // Copy bits from active read frame into input frame
-            let buffer_end = buffer.as_mut_ptr().add(uword_width);
-            let mut write_frame = CFrameItem::new_write(bit_width, buffer_end);
-            for _ in 0..bit_width {
-                let bit = mac.read_bit();
-                c_writeBit(&mut write_frame, bit);
+    /// Execute one environment jet from its padded input, returning its typed output.
+    ///
+    /// Custom jet callbacks can use this to delegate wrapped built-in jets. A short input
+    /// or a failed jet returns [`JetFailed`]. No Bit Machine or temporary program is created.
+    pub fn exec_jet<JE: JetEnvironment>(jet: &JE::Jet, input: FrameIter<'_>, env: &JE) -> Result<Value, JetFailed> {
+        let buffer = Self::jet_output(jet, input, env)?;
+        let target = jet.target_ty().to_final();
+        let mut remaining = target.bit_width();
+        // The frame reads only the declared output bits while its backing buffer stays alive.
+        let mut frame = unsafe { CFrameItem::new_read(remaining, buffer.as_ptr()) };
+        let bytes = (0..remaining.div_ceil(8)).map(|_| {
+            let mut byte = 0;
+            for bit in 0..remaining.min(8) {
+                if unsafe { c_readBit(&mut frame) } {byte |= 1 << (7 - bit);}
             }
-            mac.back(bit_width);
+            remaining = remaining.saturating_sub(8);
+            byte
+        });
+        Ok(Value::from_padded_bits(&mut crate::BitIter::from(bytes), &target).unwrap())
+    }
 
-            // Convert input frame into read frame
-            let buffer_ptr = buffer.as_mut_ptr();
-            let read_frame = CFrameItem::new_read(bit_width, buffer_ptr);
+    fn exec_jet_into_frame<JE: JetEnvironment>(&mut self, jet: &JE::Jet, env: &JE) -> Result<(), JetFailed> {
+        let input = self.read.last().map(|frame| frame.as_bit_iter_from_cursor(&self.data))
+            .unwrap_or(crate::BitIter::from([].iter().copied()));
+        let buffer = Self::jet_output(jet, input, env)?;
+        let width = jet.target_ty().to_bit_width();
+        let mut frame = unsafe { CFrameItem::new_read(width, buffer.as_ptr()) };
+        for _ in 0..width {self.write_bit(unsafe { c_readBit(&mut frame) });}
+        Ok(())
+    }
 
-            (read_frame, buffer)
-        }
-
-        /// Create C write frame that is as wide as `bit_width`.
-        ///
-        /// Return C write frame together with underlying buffer.
-        ///
-        /// ## Safety
-        ///
-        /// The returned frame must outlive its buffer or there is a dangling pointer.
-        unsafe fn get_output_frame(bit_width: usize) -> (CFrameItem, Vec<UWORD>) {
-            let uword_width = uword_width(bit_width);
-            let mut buffer = vec![0; uword_width];
-
-            // Return output frame as write frame
-            let buffer_end = buffer.as_mut_ptr().add(uword_width);
-            let write_frame = CFrameItem::new_write(bit_width, buffer_end);
-
-            (write_frame, buffer)
-        }
-
-        /// Write `bit_width` many bits from `buffer` into active write frame.
-        ///
-        /// ## Panics
-        ///
-        /// Active write frame has fewer bits than `bit_width`.
-        ///
-        /// Buffer has fewer than bits than `bit_width` (converted to UWORDs).
-        fn update_active_write_frame(mac: &mut BitMachine, bit_width: usize, buffer: &[UWORD]) {
-            assert!(bit_width <= mac.active_write_bit_width());
-            assert!(uword_width(bit_width) <= buffer.len());
-            let buffer_ptr = buffer.as_ptr();
-            let mut read_frame = unsafe { CFrameItem::new_read(bit_width, buffer_ptr) };
-
-            for _ in 0..bit_width {
-                let bit = unsafe { c_readBit(&mut read_frame) };
-                mac.write_bit(bit);
-            }
-        }
-
-        // Sanity Check: This should never really fail, but still good to do
-        if !simplicity_sys::c_jets::sanity_checks() {
-            return Err(JetFailed);
-        }
-
+    fn jet_output<JE: JetEnvironment>(jet: &JE::Jet, mut input: FrameIter<'_>, env: &JE) -> Result<Vec<UWORD>, JetFailed> {
+        if !simplicity_sys::c_jets::sanity_checks() {return Err(JetFailed)}
         let input_width = jet.source_ty().to_bit_width();
         let output_width = jet.target_ty().to_bit_width();
-        // Input buffer is implicitly referenced by input read frame!
-        // Same goes for output buffer
-        let (input_read_frame, _input_buffer) = unsafe { get_input_frame(self, input_width) };
-        let (mut output_write_frame, output_buffer) = unsafe { get_output_frame(output_width) };
+        let mut input_buffer = vec![0; uword_width(input_width)];
+        let mut output_buffer = vec![0; uword_width(output_width)];
 
-        let jet_fn = JE::c_jet_ptr(jet);
-        let c_env = env.c_jet_env();
-        let success = jet_fn(&mut output_write_frame, input_read_frame, c_env);
-
-        if !success {
-            Err(JetFailed)
-        } else {
-            update_active_write_frame(self, output_width, &output_buffer);
-            Ok(())
-        }
+        // Both buffers have the declared frame sizes and outlive every C frame using them.
+        let success = unsafe {
+            let input_end = input_buffer.as_mut_ptr().add(input_buffer.len());
+            let mut input_frame = CFrameItem::new_write(input_width, input_end);
+            for _ in 0..input_width {c_writeBit(&mut input_frame, input.next().ok_or(JetFailed)?);}
+            let input_frame = CFrameItem::new_read(input_width, input_buffer.as_ptr());
+            let output_end = output_buffer.as_mut_ptr().add(output_buffer.len());
+            let mut output_frame = CFrameItem::new_write(output_width, output_end);
+            JE::c_jet_ptr(jet)(&mut output_frame, input_frame, env.c_jet_env())
+        };
+        if success {Ok(output_buffer)} else {Err(JetFailed)}
     }
 }
 

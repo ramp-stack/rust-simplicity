@@ -67,14 +67,6 @@ impl Frame {
         data[byte_index] & (1 << (7 - bit_index)) != 0
     }
 
-    /// Return the current bit and advance the cursor.
-    pub(super) fn read_bit(&mut self, data: &[u8]) -> bool {
-        let (byte_index, bit_index) = get_indices(self.cursor);
-        let bit = data[byte_index] & (1 << (7 - bit_index)) != 0;
-        self.cursor += 1;
-        bit
-    }
-
     /// Write the given value to the current bit and advance the cursor.
     pub(super) fn write_bit(&mut self, bit: bool, data: &mut [u8]) {
         let (byte_index, bit_index) = get_indices(self.cursor);
